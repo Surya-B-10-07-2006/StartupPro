@@ -1,16 +1,17 @@
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
-from google import genai as google_genai
-from google.genai import types
+from groq import Groq
+import httpx
 import os
 from dotenv import load_dotenv
 import json
 from datetime import datetime
-import re 
-import sys 
+import re
+import time
 
 # --- 0. Setup and Initialization ---
 
@@ -18,53 +19,441 @@ import sys
 st.set_page_config(
     page_title="AI Startup Success Predictor",
     page_icon="🚀",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Initialize Gemini client
+# Initialize Groq client
 @st.cache_resource
-def init_gemini_client():
-    """Initialize Gemini client with error handling"""
+def init_groq_client():
+    """Initialize Groq client with error handling"""
     try:
         load_dotenv()
-        api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
+        api_key = os.getenv('GROQ_API_KEY')
         
         if not api_key:
-            st.error("❌ GEMINI_API_KEY not found. Please set it in your environment or a .env file.")
+            st.error("❌ GROQ_API_KEY not found. Please set it in your environment or a .env file.")
             return None
             
-        client = google_genai.Client(api_key=api_key)
+        # Create HTTP client
+        http_client = httpx.Client(
+            timeout=300.0,
+            headers={"User-Agent": "StartupPro/1.0"}
+        )
         
-        if 'chat_session' not in st.session_state:
-            config = types.GenerateContentConfig(
-                system_instruction="You are 'StartupHelpBot', a friendly, concise, and expert AI assistant for startup founders. Your goal is to answer real-time doubts about the main startup analysis, not to generate a new analysis. Keep answers brief and actionable."
-            )
-            st.session_state.chat_session = client.chats.create(
-                model="gemini-2.5-flash",
-                config=config 
-            )
-
+        # Initialize Groq client with httpx client
+        client = Groq(api_key=api_key, http_client=http_client)
         return client
         
     except Exception as e:
-        st.error(f"❌ Failed to initialize Gemini Client: {str(e)}")
+        st.error(f"❌ Failed to initialize Groq Client: {str(e)}")
         return None
 
-client = init_gemini_client()
+client = init_groq_client()
 
 # --- 1. Mock ML Prediction (Simplified) ---
 
-def predict_success_probability(startup_description):
-    """Predict success probability using only description length and base score."""
-    score = 50
-    desc_length = len(startup_description.split())
-    if desc_length < 30:
-        score += desc_length / 5
-    else:
-        score += min(desc_length / 10, 15)
+def calculate_success_probability(startup_description):
+    """Calculate success probability using the 5-factor formula"""
+    # Analyze startup description for keywords to determine factors
+    desc_lower = startup_description.lower()
     
-    return max(15, min(85, score))
+    # Market Demand (0-100)
+    market_keywords = ['demand', 'need', 'problem', 'solution', 'market', 'customers']
+    market_demand = min(100, 40 + sum(10 for keyword in market_keywords if keyword in desc_lower))
+    
+    # Competition Level (0-100, lower is better, so we invert)
+    competition_keywords = ['unique', 'innovative', 'first', 'new', 'different']
+    competition_level = max(20, 80 - sum(10 for keyword in competition_keywords if keyword in desc_lower))
+    
+    # Startup Difficulty (0-100, lower is better, so we invert)
+    difficulty_keywords = ['simple', 'easy', 'straightforward', 'basic']
+    startup_difficulty = max(30, 70 - sum(8 for keyword in difficulty_keywords if keyword in desc_lower))
+    
+    # Profit Potential (0-100)
+    profit_keywords = ['revenue', 'profit', 'monetize', 'subscription', 'sales', 'income']
+    profit_potential = min(100, 30 + sum(12 for keyword in profit_keywords if keyword in desc_lower))
+    
+    # Regulatory Complexity (0-100, lower is better, so we invert)
+    regulatory_keywords = ['fintech', 'healthcare', 'finance', 'medical', 'banking']
+    regulatory_complexity = min(80, 20 + sum(15 for keyword in regulatory_keywords if keyword in desc_lower))
+    
+    # Apply formula
+    success_score = (
+        (market_demand * 0.20) +
+        ((100 - competition_level) * 0.20) +  # Invert competition
+        ((100 - startup_difficulty) * 0.20) +  # Invert difficulty
+        (profit_potential * 0.20) +
+        ((100 - regulatory_complexity) * 0.20)  # Invert regulatory
+    )
+    
+    return max(15, min(85, success_score))
+
+def generate_success_analysis(client, startup_description, success_prob):
+    """Generate success probability analysis"""
+    try:
+        if not client:
+            return get_mock_success_analysis(success_prob)
+            
+        prompt = f"""Give a success probability out of 100 for the startup idea "{startup_description}".
+Also give a 1-line reason and a short 2-3 line explanation.
+Output format:
+score: <number>
+reason: <short reason>
+explanation: <short explanation>
+
+Provide in this JSON format:
+{{
+  "score": {success_prob},
+  "reason": "short reason",
+  "explanation": "short 2-3 line explanation"
+}}"""
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=512
+        )
+        
+        raw_text = completion.choices[0].message.content
+        
+        # Extract JSON
+        match = re.search(r"```json\s*(.*?)\s*```", raw_text, re.DOTALL)
+        if match:
+            json_content = match.group(1).strip()
+        else:
+            start_index = raw_text.find('{')
+            end_index = raw_text.rfind('}')
+            if start_index != -1 and end_index != -1:
+                json_content = raw_text[start_index:end_index + 1]
+            else:
+                return get_mock_success_analysis(success_prob)
+        
+        try:
+            result = json.loads(json_content)
+            return result
+        except:
+            return get_mock_success_analysis(success_prob)
+            
+    except Exception as e:
+        return get_mock_success_analysis(success_prob)
+
+def get_mock_success_analysis(success_prob):
+    """Generate mock success analysis"""
+    return {
+        "score": int(success_prob),
+        "reason": "Strong market potential with clear value proposition",
+        "explanation": "The startup addresses a real market need with a viable solution. Success depends on execution, market timing, and competitive positioning."
+    }
+
+def generate_monthly_explanations(client, market_prediction, month_names):
+    """Generate monthly trend explanations"""
+    try:
+        if not client:
+            return get_mock_monthly_explanations(month_names)
+            
+        # Create trend data for prompt
+        trends = []
+        for i in range(1, len(market_prediction)):
+            if market_prediction[i] > market_prediction[i-1]:
+                trends.append(f"{month_names[i]}: increased")
+            else:
+                trends.append(f"{month_names[i]}: decreased")
+        
+        prompt = f"""For each month, give a simple, one-line explanation of why the value increased or decreased compared to the previous month.
+Use simple English suitable for beginners.
+Do NOT mention arrows or percentages.
+Make explanations generic so they work for any type of startup.
+Keep each explanation under 15 words.
+
+Trends: {', '.join(trends[:5])}
+
+Output format:
+{month_names[1]}: <explanation>
+{month_names[2]}: <explanation>
+{month_names[3]}: <explanation>
+{month_names[4]}: <explanation>
+{month_names[5]}: <explanation>
+
+Provide in this JSON format:
+{{
+  "{month_names[1]}": "explanation",
+  "{month_names[2]}": "explanation",
+  "{month_names[3]}": "explanation",
+  "{month_names[4]}": "explanation",
+  "{month_names[5]}": "explanation"
+}}"""
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=512
+        )
+        
+        raw_text = completion.choices[0].message.content
+        
+        # Extract JSON
+        match = re.search(r"```json\s*(.*?)\s*```", raw_text, re.DOTALL)
+        if match:
+            json_content = match.group(1).strip()
+        else:
+            start_index = raw_text.find('{')
+            end_index = raw_text.rfind('}')
+            if start_index != -1 and end_index != -1:
+                json_content = raw_text[start_index:end_index + 1]
+            else:
+                return get_mock_monthly_explanations(month_names)
+        
+        try:
+            result = json.loads(json_content)
+            return result
+        except:
+            return get_mock_monthly_explanations(month_names)
+            
+    except Exception as e:
+        return get_mock_monthly_explanations(month_names)
+
+def get_mock_monthly_explanations(month_names):
+    """Generate mock monthly explanations"""
+    explanations = [
+        "Market demand increased due to seasonal trends",
+        "Customer interest grew through word of mouth",
+        "Competition affected market share slightly",
+        "New features attracted more users",
+        "Marketing efforts showed positive results"
+    ]
+    
+    return {month_names[i+1]: explanations[i] for i in range(min(5, len(month_names)-1))}
+
+def get_top_competitors(startup_description):
+    """Get top 5 competitors based on startup idea"""
+    try:
+        if not client:
+            return get_mock_competitors(startup_description)
+            
+        prompt = f"""Analyze this startup idea and identify the top 5 real competitors in this market:
+
+Startup Idea: {startup_description}
+
+Provide exactly 5 competitor names in this JSON format:
+{{
+  "competitors": ["Competitor 1", "Competitor 2", "Competitor 3", "Competitor 4", "Competitor 5"]
+}}
+
+Focus on real, well-known companies in the same industry/market."""
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=512
+        )
+        
+        raw_text = completion.choices[0].message.content
+        
+        # Extract JSON
+        match = re.search(r"```json\s*(.*?)\s*```", raw_text, re.DOTALL)
+        if match:
+            json_content = match.group(1).strip()
+        else:
+            start_index = raw_text.find('{')
+            end_index = raw_text.rfind('}')
+            if start_index != -1 and end_index != -1:
+                json_content = raw_text[start_index:end_index + 1]
+            else:
+                return get_mock_competitors(startup_description)
+        
+        try:
+            result = json.loads(json_content)
+            return result.get('competitors', get_mock_competitors(startup_description))
+        except:
+            return get_mock_competitors(startup_description)
+            
+    except Exception as e:
+        return get_mock_competitors(startup_description)
+
+def generate_startup_names(client, startup_description):
+    """Generate creative startup names"""
+    try:
+        if not client:
+            return get_mock_startup_names()
+            
+        prompt = f"""Generate 5 creative and relevant business names for this startup idea:
+
+Startup Idea: {startup_description}
+
+Provide names in this JSON format:
+{{
+  "names": ["Name1", "Name2", "Name3", "Name4", "Name5"]
+}}
+
+Make names short, catchy, and relevant to the business."""
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.8,
+            max_tokens=512
+        )
+        
+        raw_text = completion.choices[0].message.content
+        
+        # Extract JSON
+        match = re.search(r"```json\s*(.*?)\s*```", raw_text, re.DOTALL)
+        if match:
+            json_content = match.group(1).strip()
+        else:
+            start_index = raw_text.find('{')
+            end_index = raw_text.rfind('}')
+            if start_index != -1 and end_index != -1:
+                json_content = raw_text[start_index:end_index + 1]
+            else:
+                return get_mock_startup_names()
+        
+        try:
+            result = json.loads(json_content)
+            return result.get('names', get_mock_startup_names())
+        except:
+            return get_mock_startup_names()
+            
+    except Exception as e:
+        return get_mock_startup_names()
+
+def get_mock_startup_names():
+    """Generate mock startup names"""
+    return ['InnovatePro', 'StartupHub', 'VentureCore', 'LaunchPad', 'GrowthWave']
+
+def generate_social_media_strategy(client, startup_description):
+    """Generate social media content ideas"""
+    try:
+        if not client:
+            return get_mock_social_strategy()
+            
+        prompt = f"""Give 5-6 very simple and attractive social media strategy tips for the startup idea "{startup_description}".
+Rules:
+- Use simple English.
+- Keep each tip short (max 8-10 words).
+- Make it practical and beginner-friendly.
+- No complex marketing terms.
+
+Provide in this JSON format:
+{{
+  "tips": ["tip1", "tip2", "tip3", "tip4", "tip5"]
+}}"""
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=1024
+        )
+        
+        raw_text = completion.choices[0].message.content
+        
+        # Extract JSON
+        match = re.search(r"```json\s*(.*?)\s*```", raw_text, re.DOTALL)
+        if match:
+            json_content = match.group(1).strip()
+        else:
+            start_index = raw_text.find('{')
+            end_index = raw_text.rfind('}')
+            if start_index != -1 and end_index != -1:
+                json_content = raw_text[start_index:end_index + 1]
+            else:
+                return get_mock_social_strategy()
+        
+        try:
+            result = json.loads(json_content)
+            return result.get('tips', get_mock_social_strategy())
+        except:
+            return get_mock_social_strategy()
+            
+    except Exception as e:
+        return get_mock_social_strategy()
+
+def get_mock_social_strategy():
+    """Generate mock social media strategy"""
+    return [
+        "Post daily updates about your product",
+        "Share customer success stories",
+        "Create simple how-to videos",
+        "Ask questions to engage followers",
+        "Show behind-the-scenes content"
+    ]
+
+def generate_competitor_tips(client, startup_description):
+    """Generate competitor advantage tips"""
+    try:
+        if not client:
+            return get_mock_competitor_tips()
+            
+        prompt = f"""Give 4 competitor advantage tips for the startup idea "{startup_description}".
+Rules:
+- Use simple English.
+- Keep each tip short (max 12-15 words).
+- Output as a list, not separate objects.
+
+Provide in this JSON format:
+{{
+  "tips": ["tip1", "tip2", "tip3", "tip4"]
+}}"""
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=512
+        )
+        
+        raw_text = completion.choices[0].message.content
+        
+        # Extract JSON
+        match = re.search(r"```json\s*(.*?)\s*```", raw_text, re.DOTALL)
+        if match:
+            json_content = match.group(1).strip()
+        else:
+            start_index = raw_text.find('{')
+            end_index = raw_text.rfind('}')
+            if start_index != -1 and end_index != -1:
+                json_content = raw_text[start_index:end_index + 1]
+            else:
+                return get_mock_competitor_tips()
+        
+        try:
+            result = json.loads(json_content)
+            return result.get('tips', get_mock_competitor_tips())
+        except:
+            return get_mock_competitor_tips()
+            
+    except Exception as e:
+        return get_mock_competitor_tips()
+
+def get_mock_competitor_tips():
+    """Generate mock competitor tips"""
+    return [
+        "Focus on better customer service",
+        "Offer unique features others don't have",
+        "Price your product competitively",
+        "Build strong brand identity"
+    ]
+
+def get_mock_competitors(startup_description):
+    """Generate mock competitors based on keywords"""
+    desc_lower = startup_description.lower()
+    
+    if any(word in desc_lower for word in ['ecommerce', 'online store', 'marketplace']):
+        return ['Amazon', 'Flipkart', 'eBay', 'Shopify', 'Etsy']
+    elif any(word in desc_lower for word in ['food', 'delivery', 'restaurant']):
+        return ['Zomato', 'Swiggy', 'Uber Eats', 'DoorDash', 'Grubhub']
+    elif any(word in desc_lower for word in ['ride', 'transport', 'taxi', 'cab']):
+        return ['Uber', 'Ola', 'Lyft', 'Grab', 'DiDi']
+    elif any(word in desc_lower for word in ['social', 'media', 'network']):
+        return ['Facebook', 'Instagram', 'Twitter', 'LinkedIn', 'TikTok']
+    elif any(word in desc_lower for word in ['fintech', 'payment', 'banking']):
+        return ['PayPal', 'Stripe', 'Square', 'Razorpay', 'Paytm']
+    else:
+        return ['Google', 'Microsoft', 'Apple', 'Meta', 'Amazon']
 
 # --- 2. Advanced Trend Analysis Simulation (Market Trend) ---
 
@@ -81,7 +470,6 @@ def simulate_market_trend(success_prob):
     growth_factor = 0.5 + (success_prob / 100) * 1.5
     noise = np.random.normal(0, 5, len(date_range))
     trend_values = base_trend + (base_trend - 50) * growth_factor + noise
-    last_val_target = 60 + success_prob / 5
     trend_values = trend_values - trend_values[0] + 40
     trend_values = pd.Series(trend_values).rolling(window=3, min_periods=1).mean().values
     
@@ -92,31 +480,109 @@ def simulate_market_trend(success_prob):
     
     return df_trend
 
-# --- 3. Gemini Analysis and Parsing ---
+def generate_legal_guidance(client, startup_description):
+    """Generate industry-specific legal guidance based on startup idea"""
+    try:
+        if not client:
+            return generate_mock_legal_guidance()
+            
+        prompt = f"""Give 5 simple legal considerations for this startup idea:
+
+Startup Idea: {startup_description}
+
+Provide exactly 5 brief guidance points in this JSON format:
+{{
+  "legal_guidance": [
+    "Point 1: Brief guidance",
+    "Point 2: Brief guidance",
+    "Point 3: Brief guidance",
+    "Point 4: Brief guidance",
+    "Point 5: Brief guidance"
+  ]
+}}
+
+Rules:
+- Use very simple English
+- No legal jargon
+- Keep each point short and clear
+- Make it suitable for beginners
+- Each point under 12 words"""
+
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=1024
+        )
+        
+        raw_text = completion.choices[0].message.content
+        
+        # Extract JSON
+        match = re.search(r"```json\s*(.*?)\s*```", raw_text, re.DOTALL)
+        if match:
+            json_content = match.group(1).strip()
+        else:
+            start_index = raw_text.find('{')
+            end_index = raw_text.rfind('}')
+            if start_index != -1 and end_index != -1:
+                json_content = raw_text[start_index:end_index + 1]
+            else:
+                return generate_mock_legal_guidance()
+        
+        try:
+            result = json.loads(json_content)
+            return result.get('legal_guidance', generate_mock_legal_guidance())
+        except:
+            return generate_mock_legal_guidance()
+            
+    except Exception as e:
+        return generate_mock_legal_guidance()
+
+def generate_mock_legal_guidance():
+    """Generate mock legal guidance when API fails"""
+    return [
+        "Register your business with the government.",
+        "Get all required licenses for your startup.",
+        "Check local rules and safety regulations.",
+        "Create basic contracts for workers and partners.",
+        "Protect your brand name or logo if needed."
+    ]
+
+# --- 3. Groq Analysis ---
 
 def generate_analysis(client, prompt):
-    """Generate analysis using Gemini API with robust JSON parsing"""
+    """Generate analysis using Groq API with robust JSON parsing and rate limiting"""
     try:
         if not client:
             return None
             
-        tool_config = types.GenerateContentConfig(
-            tools=[{"google_search": {}}]
-        )
-            
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=tool_config
+        # Add rate limiting
+        if 'last_api_call' in st.session_state:
+            time_since_last = time.time() - st.session_state.last_api_call
+            if time_since_last < 1:  # Wait 1 second between calls
+                time.sleep(1 - time_since_last)
+        
+        st.session_state.last_api_call = time.time()
+        
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=4096,
+            top_p=1,
+            stream=False,
+            stop=None
         )
         
-        if not response or not hasattr(response, 'text'):
-            st.error("❌ Invalid or empty response from Gemini API.")
-            return None
-
-        raw_text = response.text
+        raw_text = completion.choices[0].message.content
         text = raw_text.strip()
         
+        # Try to extract JSON from response
         match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
         if not match:
             match = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
@@ -130,22 +596,359 @@ def generate_analysis(client, prompt):
             if start_index != -1 and end_index != -1 and end_index > start_index:
                 json_content = text[start_index : end_index + 1]
             else:
-                st.error("❌ Could not find valid JSON delimiters in the response.")
-                st.info("Raw response from AI (for debugging): \n" + raw_text)
-                return None
+                # If no JSON found, create a mock analysis
+                return create_mock_analysis()
         
         try:
             return json.loads(json_content)
-        except json.JSONDecodeError as e:
-            st.error(f"❌ Failed to parse JSON content: {str(e)}")
-            st.info("Raw JSON Content attempting to parse:\n" + json_content)
-            return None
+        except json.JSONDecodeError:
+            # If JSON parsing fails, create mock analysis
+            return create_mock_analysis()
         
     except Exception as e:
-        st.error(f"❌ Error generating analysis: {str(e)}")
-        return None
+        error_msg = str(e)
+        if "rate_limit" in error_msg.lower() or "429" in error_msg:
+            st.error("🚫 **Rate Limit Exceeded!**")
+            st.warning("**Solutions:**")
+            st.info("1. Wait a few minutes and try again")
+            st.info("2. Groq allows 14,400 requests per day")
+        else:
+            st.error(f"❌ Error generating analysis: {error_msg}")
+        return create_mock_analysis()
 
-# --- 4. Report Generation (UPDATED for 10 Funding/Legal Points) ---
+def create_mock_analysis():
+    """Create a mock analysis when API fails"""
+    return {
+        "swot_analysis": {
+            "strengths": [
+                "Innovative concept with market potential",
+                "Clear value proposition identified",
+                "Scalable business model structure",
+                "Strong technical foundation",
+                "Experienced founding team"
+            ],
+            "weaknesses": [
+                "Limited market validation data",
+                "Resource constraints for initial launch",
+                "Competition from established players",
+                "Lack of brand recognition",
+                "Limited initial funding"
+            ],
+            "opportunities": [
+                "Growing market demand in target sector",
+                "Potential for strategic partnerships",
+                "Technology advancement enabling growth",
+                "Emerging market trends",
+                "Government support initiatives"
+            ],
+            "threats": [
+                "Market saturation risks",
+                "Regulatory changes impact",
+                "Economic downturn effects",
+                "New competitor entry"
+            ]
+        },
+        "roadmap": [
+            {"week": 1, "milestone": "Market research, competitor analysis, customer interviews, MVP planning, team setup"},
+            {"week": 2, "milestone": "Product development, prototype creation, user testing, feedback collection, iteration"},
+            {"week": 3, "milestone": "Marketing strategy, brand development, partnership outreach, funding preparation"},
+            {"week": 4, "milestone": "Beta launch, user acquisition, performance monitoring, scaling preparation, final adjustments"}
+        ],
+        "team_advice": [
+            "CEO - Leads company vision and strategy",
+            "CTO - Handles all technical development",
+            "Marketing Manager - Grows customer base",
+            "Sales Manager - Converts leads to customers",
+            "Product Manager - Defines what to build",
+            "Developer - Builds the actual product",
+            "Designer - Makes product user-friendly",
+            "Customer Support - Helps users with issues"
+        ],
+        "funding_advice": {
+             "funding_strategies": [
+                "Use your own savings first.",
+                "Ask friends or family for small support.",
+                "Take a small business loan from a bank.",
+                "Apply for government schemes or support programs.",
+                "Use crowdfunding to raise money from the public.",
+                "Find an investor who can fund and guide your business."
+            ],
+            "legal_considerations": [
+                "Register your business with the government.",
+                "Get all required licenses for your startup.",
+                "Check local rules and safety regulations.",
+                "Create basic contracts for workers and partners.",
+                "Protect your brand name or logo if needed."
+            ]
+        },
+        "success_hint": "Focus on solving a real problem with a simple, scalable solution. Validate early and iterate based on user feedback."
+    }
+
+# --- 4. Enhanced Visual Components ---
+
+def create_team_cards(team_advice):
+    """Create attractive team cards with emojis"""
+    role_emojis = {
+        'CEO': '👑', 'CTO': '💻', 'CMO': '📈', 'Sales': '💼', 'Product': '🎯',
+        'Developer': '⚡', 'Designer': '🎨', 'Data': '📊', 'Operations': '⚙️', 'Customer': '🤝'
+    }
+    
+    st.markdown("## 👥 Team & Hiring Strategy")
+    
+    # Create 2 rows of 5 cards each
+    for row in range(2):
+        cols = st.columns(5)
+        for col_idx in range(5):
+            card_idx = row * 5 + col_idx
+            if card_idx < len(team_advice):
+                advice = team_advice[card_idx]
+                role = advice.split(':')[0].strip()
+                description = advice.split(':', 1)[1].strip() if ':' in advice else advice
+                
+                # Find matching emoji
+                emoji = '👤'
+                for key, value in role_emojis.items():
+                    if key.lower() in role.lower():
+                        emoji = value
+                        break
+                
+                with cols[col_idx]:
+                    st.markdown(f"""
+                    <div style="
+                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                        padding: 20px;
+                        border-radius: 15px;
+                        text-align: center;
+                        color: white;
+                        margin: 10px 0;
+                        box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+                        height: 180px;
+                        display: flex;
+                        flex-direction: column;
+                        justify-content: center;
+                    ">
+                        <div style="font-size: 40px; margin-bottom: 10px;">{emoji}</div>
+                        <div style="font-weight: bold; font-size: 16px; margin-bottom: 8px;">{role}</div>
+                        <div style="font-size: 12px; line-height: 1.4;">{description}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+def create_roadmap_infographic(roadmap):
+    """Create attractive roadmap infographic"""
+    st.markdown("## 🗓️ 12-Week Execution Roadmap")
+    
+    # Create timeline visualization
+    weeks = [item.get('week', i+1) for i, item in enumerate(roadmap)]
+    milestones = [item.get('milestone', 'No milestone') for item in roadmap]
+    
+    # Create Gantt-style chart
+    fig = go.Figure()
+    
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD'] * 2
+    
+    for i, (week, milestone) in enumerate(zip(weeks, milestones)):
+        fig.add_trace(go.Scatter(
+            x=[week, week+0.8],
+            y=[i, i],
+            mode='lines+markers',
+            line=dict(color=colors[i % len(colors)], width=8),
+            marker=dict(size=12, color=colors[i % len(colors)]),
+            name=f"Week {week}",
+            hovertemplate=f"<b>Week {week}</b><br>{milestone}<extra></extra>",
+            showlegend=False
+        ))
+        
+        # Add milestone text
+        fig.add_annotation(
+            x=week+1,
+            y=i,
+            text=f"<b>Week {week}:</b> {milestone[:40]}{'...' if len(milestone) > 40 else ''}",
+            showarrow=False,
+            xanchor="left",
+            font=dict(size=11, color=colors[i % len(colors)])
+        )
+    
+    fig.update_layout(
+        title="📈 Startup Execution Timeline",
+        xaxis_title="Weeks",
+        yaxis_title="Milestones",
+        height=600,
+        showlegend=False,
+        xaxis=dict(range=[0, 14]),
+        yaxis=dict(showticklabels=False),
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)'
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+def create_swot_analysis(swot):
+    """Create simple SWOT analysis with expandable sections"""
+    st.markdown("## 🔍 SWOT Analysis")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        with st.expander("✅ Strengths", expanded=True):
+            for item in swot.get('strengths', []): 
+                st.markdown(f"- **{item}**")
+        with st.expander("❌ Weaknesses", expanded=True):
+            for item in swot.get('weaknesses', []): 
+                st.markdown(f"- **{item}**")
+    with col2:
+        with st.expander("💡 Opportunities", expanded=True):
+            for item in swot.get('opportunities', []): 
+                st.markdown(f"- **{item}**")
+        with st.expander("⚠️ Threats", expanded=True):
+            for item in swot.get('threats', []): 
+                st.markdown(f"- **{item}**")
+
+def create_market_intelligence_charts(success_prob, competitors, startup_names, competitor_tips, success_analysis):
+    """Create specific market intelligence visualizations"""
+    st.markdown("## 📊 Real-Time Market Intelligence")
+    
+    # Success Analysis Display
+    st.markdown("### 🎯 Success Probability Analysis")
+    st.markdown(f"**Score:** {success_analysis['score']}/100")
+    st.markdown(f"**Reason:** {success_analysis['reason']}")
+    st.markdown(f"**Explanation:** {success_analysis['explanation']}")
+    
+    st.markdown("---")
+    
+    # Startup Naming Suggestions
+    st.markdown("### 🏷️ Startup Naming Suggestions")
+    cols = st.columns(len(startup_names))
+    for i, name in enumerate(startup_names):
+        with cols[i % len(cols)]:
+            st.info(f"**{name}**")
+    
+    st.markdown("---")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Top 5 Competitors List
+        st.markdown("### 🏆 Top 5 Competitors")
+        for i, competitor in enumerate(competitors, 1):
+            st.markdown(f"{i}. **{competitor}**")
+        
+        # Bar Chart - Multiple category ratings
+        rating_categories = ['Product-Market Fit', 'Technical Feasibility', 'Market Timing', 'Competitive Advantage']
+        ratings = [success_prob + np.random.normal(0, 8) for _ in rating_categories]
+        ratings = [max(0, min(100, r)) for r in ratings]
+        
+        fig_bar = px.bar(
+            x=rating_categories,
+            y=ratings,
+            title="📈 Category Ratings",
+            color=ratings,
+            color_continuous_scale='viridis'
+        )
+        fig_bar.update_layout(height=400, showlegend=False)
+        st.plotly_chart(fig_bar, use_container_width=True)
+    
+    with col2:
+        # Competitor Advantage Tips
+        st.markdown("### 🎯 Competitor Advantage Tips")
+        for i, tip in enumerate(competitor_tips, 1):
+            st.success(f"{i}. {tip}")
+        
+        # Gauge Chart - Single prediction score
+        fig_gauge = go.Figure(go.Indicator(
+            mode = "gauge+number+delta",
+            value = success_prob,
+            domain = {'x': [0, 1], 'y': [0, 1]},
+            title = {'text': "🎯 Success Probability"},
+            delta = {'reference': 50},
+            gauge = {
+                'axis': {'range': [None, 100]},
+                'bar': {'color': "darkblue"},
+                'steps': [
+                    {'range': [0, 25], 'color': "lightgray"},
+                    {'range': [25, 50], 'color': "gray"},
+                    {'range': [50, 75], 'color': "lightgreen"},
+                    {'range': [75, 100], 'color': "green"}
+                ],
+                'threshold': {
+                    'line': {'color': "red", 'width': 4},
+                    'thickness': 0.75,
+                    'value': 90
+                }
+            }
+        ))
+        fig_gauge.update_layout(height=300)
+        st.plotly_chart(fig_gauge, use_container_width=True)
+        
+        # Line Chart - Market prediction over time with normalized values
+        dates = pd.date_range(start=datetime.now(), periods=12, freq='M')
+        # Normalize trend to match success probability
+        base_value = success_prob
+        trend_variation = 10  # Smaller variation range
+        market_prediction = [base_value + np.random.normal(0, trend_variation) for _ in range(12)]
+        market_prediction = [max(10, min(90, p)) for p in market_prediction]
+        
+        fig_line = px.line(
+            x=dates,
+            y=market_prediction,
+            title="📈 Market Prediction Over Time",
+            labels={'x': 'Time', 'y': 'Market Score (%)'}
+        )
+        fig_line.update_traces(line_color='#ff7f0e', line_width=3)
+        fig_line.update_layout(height=300)
+        st.plotly_chart(fig_line, use_container_width=True)
+        
+        # Monthly trend explanations
+        month_names = [date.strftime('%B') for date in dates]
+        explanations = generate_monthly_explanations(client, market_prediction, month_names)
+        
+        st.markdown("**Monthly Trends:**")
+        for month, explanation in explanations.items():
+            st.markdown(f"**{month}:** {explanation}")
+
+def create_team_hiring_strategy():
+    """Create task-based team hiring strategy"""
+    st.markdown("## 👥 Team & Hiring Strategy")
+    
+    # Core hiring principles
+    st.markdown("### 🎯 Core Hiring Principles")
+    principles = [
+        "Identify core tasks your startup must do daily",
+        "Convert each core task into a role (tech, marketing, operations, etc.)",
+        "Hire for skills, not titles — match skills to your startup needs",
+        "Start small with essential roles; expand later",
+        "Use freelancers for non-core or temporary work",
+        "Prioritize multifunctional people in early stages",
+        "Hire someone stronger than you in technical or specialized areas",
+        "Check experience in similar industries to reduce training time",
+        "Use structured interviews with task-based tests",
+        "Build a culture-first team to ensure long-term fit"
+    ]
+    
+    for i, principle in enumerate(principles, 1):
+        st.markdown(f"{i}. **{principle}**")
+    
+    st.markdown("### 💼 Essential Startup Roles")
+    
+    # Essential roles with tasks
+    roles_data = {
+        'Role': ['Technical Lead', 'Marketing Lead', 'Operations Lead', 'Sales Lead', 'Product Lead'],
+        'Core Tasks': [
+            'Product development, technical architecture, code review',
+            'Brand building, content creation, digital marketing',
+            'Process optimization, vendor management, logistics',
+            'Customer acquisition, relationship building, revenue generation',
+            'User research, feature planning, roadmap management'
+        ],
+        'Hire When': [
+            'Need technical expertise beyond founder skills',
+            'Ready to scale customer acquisition',
+            'Daily operations become complex',
+            'Product-market fit achieved',
+            'Multiple feature requests from users'
+        ]
+    }
+    
+    df_roles = pd.DataFrame(roles_data)
+    st.dataframe(df_roles, use_container_width=True)
 
 def generate_report_content(analysis_data, success_prob, startup_description):
     """Generate structured text content for the report (TXT/Markdown)."""
@@ -176,7 +979,7 @@ def generate_report_content(analysis_data, success_prob, startup_description):
         for advice in analysis_data.get('team_advice', []):
              report += f"* {advice}\n"
             
-        # Funding & Legal Advice - UPDATED
+        # Funding & Legal Advice
         funding_advice = analysis_data.get('funding_advice', {})
         report += "\n## 💰 Funding & Legal Advice\n"
         
@@ -196,38 +999,7 @@ def generate_report_content(analysis_data, success_prob, startup_description):
         st.error(f"❌ Error generating report content: {str(e)}")
         return None
 
-# --- 5. Chatbot Function (Real-time Chat) ---
-
-def startup_chatbot_ui():
-    """Adds an interactive chatbot to the sidebar for real-time doubts."""
-    st.sidebar.markdown("---")
-    st.sidebar.header("💬 Real-Time Startup Advisor")
-    st.sidebar.info("Ask follow-up questions about the analysis.")
-
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []
-        
-    for message in st.session_state.chat_messages:
-        with st.sidebar.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    if prompt := st.sidebar.chat_input("Ask a follow-up question..."):
-        st.session_state.chat_messages.append({"role": "user", "content": prompt})
-        with st.sidebar.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.sidebar.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    response = st.session_state.chat_session.send_message(prompt)
-                    full_response = response.text
-                    st.markdown(full_response)
-                    st.session_state.chat_messages.append({"role": "assistant", "content": full_response})
-                except Exception as e:
-                    st.error(f"Chatbot Error: {e}")
-
-
-# --- 6. Main Streamlit Function ---
+# --- 5. Main Streamlit Function ---
 
 def main():
     """Main function to run the Streamlit app"""
@@ -236,8 +1008,6 @@ def main():
 
     if not client:
         return
-
-    startup_chatbot_ui() 
 
     st.markdown("## 📝 Enter Your Startup Idea")
     
@@ -252,178 +1022,107 @@ def main():
             st.error("❌ Please enter a valid startup description.")
             return
 
-        st.session_state.chat_messages = []
-        
-        system_prompt = "You are 'StartupHelpBot', a friendly, concise, and expert AI assistant for startup founders. The user just started a new analysis. All your subsequent answers must be brief and actionable, specifically relating to the content of the analysis. Do not generate a new full analysis."
-        
-        initial_message = f"The new startup idea being analyzed is: {startup_description}. The initial success probability is {predict_success_probability(startup_description):.1f}%."
-
-        initial_history = [
-            types.Content(
-                role="user",
-                parts=[types.Part(text=initial_message)] 
-            )
-        ]
-        
-        config = types.GenerateContentConfig(
-            system_instruction=system_prompt
-        )
-
-        st.session_state.chat_session = client.chats.create(
-            model="gemini-2.5-flash",
-            history=initial_history,
-            config=config
-        )
-
-
         with st.spinner("🧠 Analyzing your startup idea and checking market trends..."):
             try:
-                success_prob = predict_success_probability(startup_description)
+                success_prob = calculate_success_probability(startup_description)
+                success_analysis = generate_success_analysis(client, startup_description, success_prob)
                 
-                # --- PROMPT CONSTRUCTION (UPDATED FOR 10 ROLES AND 10 ADVICE POINTS) ---
+                # Get top competitors
+                with st.spinner("🏆 Identifying top competitors..."):
+                    competitors = get_top_competitors(startup_description)
                 
-                SYSTEM_INSTRUCTION = """
-                You are 'StartupPro', an elite, data-driven startup success advisor. Use the Google Search tool to inform your analysis.
-                YOUR OUTPUT MUST BE A SINGLE, VALID JSON OBJECT THAT STRICTLY ADHERES to the structure provided below.
-                DO NOT include any introductory text, explanation, markdown formatting (like ```json), or commentary outside of the JSON structure.
-                """
-
-                # JSON TEMPLATE REFLECTING THE NEW REQUIREMENTS
-                JSON_TEMPLATE = json.dumps({
-                    "swot_analysis": {
-                        "strengths": ["...", "...", "..."], 
-                        "weaknesses": ["...", "...", "..."],
-                        "opportunities": ["...", "...", "..."],
-                        "threats": ["...", "..."]
-                    },
-                    "roadmap": [{"week": i+1, "milestone": f"Week {i+1} milestone..."} for i in range(12)],
-                    "team_advice": [f"Role {i+1}: ..." for i in range(10)], # 10 roles requested
-                    "funding_advice": {
-                        "funding_strategies": ["Strategy 1", "Strategy 2", "Strategy 3", "Strategy 4", "Strategy 5"], # 5 funding points
-                        "legal_considerations": ["Legal 1", "Legal 2", "Legal 3", "Legal 4", "Legal 5"] # 5 legal points
-                    },
-                    "success_hint": "..."
-                }, indent=2)
-
-                prompt = f"""{SYSTEM_INSTRUCTION}
-                Analyze this startup idea and provide a comprehensive analysis. Use your search tool to find relevant market information, competitor data, and current trends to make the analysis realistic.
+                # Get startup names, social media strategy, and competitor tips
+                with st.spinner("🏷️ Generating startup names and strategies..."):
+                    startup_names = generate_startup_names(client, startup_description)
+                    social_strategy = generate_social_media_strategy(client, startup_description)
+                    competitor_tips = generate_competitor_tips(client, startup_description)
                 
-                Startup Idea: {startup_description}
-                Success Probability (AI Model): {success_prob:.1f}%
+                # Generate industry-specific legal guidance
+                with st.spinner("⚖️ Generating industry-specific legal guidance..."):
+                    legal_guidance = generate_legal_guidance(client, startup_description)
+                
+                # --- PROMPT CONSTRUCTION ---
+                
+                prompt = f"""You are StartupPro, an elite business analyst. Analyze this startup idea and provide a comprehensive business analysis in valid JSON format.
 
-                **Specific Requirements:**
-                1. ROADMAP: Generate a **specific milestone for each of the 12 weeks**.
-                2. TEAM ADVICE: Provide a list of exactly **10 essential and suitable roles (e.g., 'CTO', 'Lead UX Designer', 'CMO')** followed by detailed advice for each role.
-                3. FUNDING/LEGAL: Generate exactly **5 distinct funding strategies** and exactly **5 critical legal considerations**. Ensure all 10 points are concise and high-value.
+Startup Idea: {startup_description}
+Success Probability: {success_prob:.1f}%
 
-                Your response MUST be a valid JSON object matching this structure:
-                {JSON_TEMPLATE}
-                """
+Provide your analysis in this exact JSON structure:
+{{
+  "swot_analysis": {{
+    "strengths": ["strength1", "strength2", "strength3", "strength4", "strength5"],
+    "weaknesses": ["weakness1", "weakness2", "weakness3", "weakness4", "weakness5"],
+    "opportunities": ["opportunity1", "opportunity2", "opportunity3", "opportunity4", "opportunity5"],
+    "threats": ["threat1", "threat2", "threat3", "threat4", "threat5"]
+  }},
+  "roadmap": [
+    {{"week": 1, "milestone": "Week 1: 3-5 action steps"}},
+    {{"week": 2, "milestone": "Week 2: 3-5 action steps"}},
+    {{"week": 3, "milestone": "Week 3: 3-5 action steps"}},
+    {{"week": 4, "milestone": "Week 4: 3-5 action steps"}}
+  ],
+  "team_advice": [
+    "CEO - Leads company vision and strategy",
+    "CTO - Handles all technical development",
+    "Marketing Manager - Grows customer base",
+    "Sales Manager - Converts leads to customers",
+    "Product Manager - Defines what to build",
+    "Developer - Builds the actual product",
+    "Designer - Makes product user-friendly",
+    "Customer Support - Helps users with issues"
+  ],
+  "funding_advice": {{
+    "funding_strategies": ["strategy1", "strategy2", "strategy3", "strategy4", "strategy5"],
+    "legal_considerations": ["legal1", "legal2", "legal3", "legal4", "legal5"]
+  }}
+}}
+
+For SWOT Analysis: EXACTLY 5 points in each category. Keep each point short (max 8-10 words). Use simple language.
+
+For Team Advice: Give 8 essential roles with 1-line explanation each. Format: "Role - What they do". Keep simple.
+
+For Roadmap: Create EXACTLY 4 weeks. Each week should have 3-5 clear, short action steps.
+
+Respond ONLY with valid JSON. No additional text or explanation."""
                 
                 analysis = generate_analysis(client, prompt)
                 
                 if not analysis:
                     return
                 
-                # --- Display results ---
+                # --- Display Enhanced Results ---
                 st.markdown("---")
                 
-                st.markdown("## 📊 Success Prediction & Market Analysis")
-                col_metric, col_pie, col_line_chart = st.columns([1, 1, 3]) 
-                
-                with col_metric:
-                    st.metric("Success Probability", f"{success_prob:.1f}%", help="Based on internal AI model and description detail.")
-
-                # PIE CHART
-                df_pie = pd.DataFrame({
-                    'Category': ['Success Probability', 'Risk/Failure Probability'],
-                    'Value': [success_prob, 100 - success_prob]
-                })
-
-                fig_pie = px.pie(
-                    df_pie, 
-                    values='Value', 
-                    names='Category', 
-                    title='Probability Breakdown',
-                    hole=.5, 
-                    color='Category',
-                    color_discrete_map={'Success Probability':'green', 'Risk/Failure Probability':'red'}
-                )
-                fig_pie.update_traces(textinfo='percent', marker=dict(line=dict(color='#000000', width=1)))
-                fig_pie.update_layout(showlegend=False, margin=dict(t=50, b=10, l=10, r=10)) 
-
-                with col_pie:
-                    st.plotly_chart(fig_pie, use_container_width=True)
-
-                # LINE CHART
-                with col_line_chart:
-                    st.markdown("### 📈 Trajectory vs. Market Trend")
-                    
-                    df_trajectory = pd.DataFrame({
-                        'Week': range(1, 13),
-                        'Value': np.linspace(max(10, success_prob * 0.8), min(90, success_prob * 1.2), 12),
-                        'Series': '12-Week Strategy Trajectory'
-                    })
-
-                    df_market = simulate_market_trend(success_prob)
-                    
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=df_trajectory['Week'], y=df_trajectory['Value'],
-                        mode='lines+markers', name='Strategy Trajectory (12 Weeks)',
-                        line=dict(color='green', width=3)
-                    ))
-
-                    df_market_last_12 = df_market.tail(12).reset_index(drop=True)
-                    df_market_last_12['Week'] = df_market_last_12.index + 1
-                    
-                    fig.add_trace(go.Scatter(
-                        x=df_market_last_12['Week'], y=df_market_last_12['Market Interest Score'],
-                        mode='lines', name='Market Interest Trend (Last Year)',
-                        line=dict(color='orange', dash='dash')
-                    ))
-
-                    fig.update_layout(
-                        xaxis_title='Week of Execution', yaxis_title='Score (%)',
-                        yaxis_range=[0, 100],
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                    )
-
-                    st.plotly_chart(fig, use_container_width=True)
+                # Market Intelligence Charts
+                create_market_intelligence_charts(success_prob, competitors, startup_names, competitor_tips, success_analysis)
                 
                 st.markdown("---")
                 
-                st.markdown("## 🔍 SWOT Analysis")
-                swot = analysis.get('swot_analysis', {})
-                col1, col2 = st.columns(2)
+                # Simple SWOT Analysis
+                create_swot_analysis(analysis.get('swot_analysis', {}))
                 
-                with col1:
-                    with st.expander("✅ Strengths", expanded=True):
-                        for item in swot.get('strengths', []): st.markdown(f"- **{item}**")
-                    with st.expander("❌ Weaknesses", expanded=True):
-                        for item in swot.get('weaknesses', []): st.markdown(f"- **{item}**")
-                with col2:
-                    with st.expander("💡 Opportunities", expanded=True):
-                        for item in swot.get('opportunities', []): st.markdown(f"- **{item}**")
-                    with st.expander("⚠️ Threats", expanded=True):
-                        for item in swot.get('threats', []): st.markdown(f"- **{item}**")
+                st.markdown("---")
                 
-                st.markdown("## 🗓️ 12-Week Roadmap")
+                # Simple Roadmap Table
+                st.markdown("## 🗓️ 4-Week Execution Roadmap")
                 roadmap = analysis.get('roadmap', [])
                 if roadmap and isinstance(roadmap, list):
-                    cleaned_roadmap = [{'Week': item.get('week', i+1), 'Milestone': item.get('milestone', 'N/A')} 
+                    cleaned_roadmap = [{'Week': item.get('week', i+1), 'Action Steps': item.get('milestone', 'N/A')} 
                                        for i, item in enumerate(roadmap)]
                     df_roadmap = pd.DataFrame(cleaned_roadmap)
                     df_roadmap.set_index('Week', inplace=True)
                     st.dataframe(df_roadmap, use_container_width=True)
                 else:
                     st.warning("Roadmap data is missing or incomplete.")
-
-                # UPDATED TEAM ADVICE SECTION
-                st.markdown("## 👥 Team & Hiring Advice")
-                for advice in analysis.get('team_advice', []): st.markdown(f"• **{advice}**")
                 
-                # UPDATED FUNDING & LEGAL SECTION
+                st.markdown("---")
+                
+                # Task-based Team Hiring Strategy
+                st.markdown("## 👥 Team & Hiring Advice")
+                for i, role in enumerate(analysis.get('team_advice', []), 1):
+                    st.markdown(f"{i}. **{role}**")
+                
                 st.markdown("## 💰 Funding & Legal Advice")
                 funding_advice = analysis.get('funding_advice', {})
                 
@@ -432,13 +1131,17 @@ def main():
                     st.success(f"• {strategy}")
                 
                 st.markdown("### ⚖️ Legal Considerations")
-                for legal in funding_advice.get('legal_considerations', []): 
-                    st.warning(f"• {legal}")
+                st.info("📝 **Note:** These are general guidance points, not legal advice. Consult a lawyer for specific legal matters.")
+                for i, legal in enumerate(legal_guidance, 1):
+                    st.warning(f"{i}. {legal}")
                 
-                st.markdown("## 💡 Key Success Hint")
-                st.info(analysis.get('success_hint', 'No specific advice available'))
+                # Social Media Strategy
+                st.markdown("### 📱 Social Media Strategy")
                 
-                # 8. Download Report
+                for i, tip in enumerate(social_strategy, 1):
+                    st.success(f"{i}. {tip}")
+                
+                # Download Report
                 st.markdown("---")
                 st.markdown("### 📥 Download Full Report")
                 
